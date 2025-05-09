@@ -1,0 +1,300 @@
+#include <NewPing.h>
+#include <TimerOne.h>
+
+//#define DBG
+
+#define ENTER_CRITICAL()    asm("cli \n")
+#define EXIT_CRITICAL()     asm("sei \n")
+
+#ifdef DBG
+#define DIAGNOSTICS(x)  x
+#else
+#define DIAGNOSTICS(x)
+#endif
+
+// input devices
+#define MAX_DISTANCE 400  // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
+
+#define TOP_SONAR_TRIGGER     4
+#define TOP_SONAR_ECHO        6
+#define BOTTOM_SONAR_TRIGGER  5
+#define BOTTOM_SONAR_ECHO     7
+#define WATER_SENSOR          A0
+
+NewPing top_sonar(TOP_SONAR_TRIGGER, TOP_SONAR_ECHO, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+NewPing bottom_sonar(BOTTOM_SONAR_TRIGGER, BOTTOM_SONAR_ECHO, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+
+// output devices
+#define BUZZER    8
+#define VIBRATOR  3
+
+#define TURN_ON_BUZZER()    digitalWrite(BUZZER, 1)
+#define TURN_OFF_BUZZER()   digitalWrite(BUZZER, 0)
+#define TURN_ON_VIBRATOR()  digitalWrite(VIBRATOR, 0)
+#define TURN_OFF_VIBRATOR() digitalWrite(VIBRATOR, 1)
+
+// trigger mechanism
+#define TRG_SLOT_1  0
+#define TRG_SLOT_2  1
+#define TRG_SLOT_3  2
+#define TRG_SLOT_4  3
+#define TRG_SLOT_5  4
+#define TRG_SLOT_6  5
+#define TRG_LAST    6
+#define TRG_MAX     TRG_LAST
+
+typedef uint8_t       trg_time;
+typedef void *        trg_cb_data_p;
+typedef void (*trg_callback) (trg_cb_data_p);
+
+struct trg_desc {
+trg_time ticks;
+trg_callback cb;
+trg_cb_data_p dp;
+} triggers[TRG_MAX];
+
+void trg_init(void);
+void trg_inc_tmr(void);
+uint8_t trg_check_callbacks(void);
+uint8_t trg_install(uint8_t slot, uint8_t ticks, trg_callback cb, trg_cb_data_p dp);
+
+void trg_init(void)
+{
+uint8_t i;
+for(i = 0; i < TRG_MAX; i++) {
+triggers[i].ticks = 0;
+triggers[i].cb = NULL;
+triggers[i].dp = NULL;
+}
+}
+
+void trg_inc_tmr(void)
+{
+uint8_t i;
+ENTER_CRITICAL();
+for(i = 0; i < TRG_MAX; i++) {
+if(triggers[i].ticks != 0) {
+triggers[i].ticks--;
+}
+}
+EXIT_CRITICAL();
+while(trg_check_callbacks()) {
+// do nothing
+}
+}
+
+uint8_t trg_check_callbacks(void)
+{
+uint8_t i, cb_called = 0;
+trg_callback cb = NULL;
+trg_cb_data_p dp;
+for(i = 0; i < TRG_MAX; i++) {
+ENTER_CRITICAL();
+if(triggers[i].ticks == 0 && triggers[i].cb != NULL) {
+cb = triggers[i].cb;
+dp = triggers[i].dp;
+triggers[i].cb = NULL;
+(*cb) (dp);     // calling callback function
+cb_called = 1;
+}
+EXIT_CRITICAL();
+}
+return cb_called;
+}
+
+uint8_t trg_install(uint8_t slot, uint8_t ticks, trg_callback cb, trg_cb_data_p dp)
+{
+ENTER_CRITICAL();
+triggers[slot].ticks = ticks;
+triggers[slot].cb = cb;
+triggers[slot].dp = dp;
+EXIT_CRITICAL();
+
+return 1;
+}
+// trigger mechanism ends
+
+// alert mechanism
+#define ALERT_PERIOD   10
+
+static bool alert_flag;
+static uint8_t alert_on_period;
+
+void alert(trg_cb_data_p dp)
+{
+trg_install(TRG_SLOT_4, 2, vibe_on, NULL);
+trg_install(TRG_SLOT_5, 4, buzz_on, NULL);
+}3
+
+void buzz_on(trg_cb_data_p dp)
+{
+volatile uint16_t off_after = (alert_on_period * ALERT_PERIOD) / 100;
+TURN_ON_BUZZER();
+trg_install(TRG_SLOT_5, (uint8_t) off_after, buzz_off, NULL);
+}
+
+void buzz_off(trg_cb_data_p dp)
+{
+TURN_OFF_BUZZER();
+if(alert_flag) {
+volatile uint16_t on_after = ALERT_PERIOD - (alert_on_period*ALERT_PERIOD) / 100;
+trg_install(TRG_SLOT_5, (uint8_t) on_after, buzz_on, NULL);
+}
+}
+
+void vibe_on(trg_cb_data_p dp)
+{
+volatile uint16_t off_after = (alert_on_period * ALERT_PERIOD) / 100;
+TURN_ON_VIBRATOR();
+trg_install(TRG_SLOT_4, (uint8_t) off_after, vibe_off, NULL);
+}
+
+void vibe_off(trg_cb_data_p dp)
+{
+TURN_OFF_VIBRATOR();
+if(alert_flag) {
+volatile uint16_t on_after = ALERT_PERIOD - (alert_on_period*ALERT_PERIOD) / 100;
+trg_install(TRG_SLOT_4, (uint8_t) on_after, vibe_on, NULL);
+}
+}
+// alert mechanism ends
+
+// obstacle detection mechanism
+static uint16_t top_sonar_data;
+static uint16_t bottom_sonar_data;
+static uint8_t  num_of_samples;
+static uint8_t  get_data_tick_counter;
+static uint16_t water_level;
+
+void get_obstacle_data()
+{
+uint16_t d;
+
+num_of_samples++;
+
+d = top_sonar.ping_cm();
+//DIAGNOSTICS( Serial.print("Instantaneous top sensor data: "); )
+//DIAGNOSTICS( Serial.print(d); )
+//DIAGNOSTICS( Serial.println(" cm"); )
+top_sonar_data += d;
+
+d = bottom_sonar.ping_cm();
+//DIAGNOSTICS( Serial.print("Instantaneous bottom sensor data: "); )
+//DIAGNOSTICS( Serial.print(d); )
+//DIAGNOSTICS( Serial.println(" cm"); )
+bottom_sonar_data += d;
+
+//water sensing
+d = analogRead(WATER_SENSOR);
+water_level += d;
+
+}
+
+#define OBSTACLE_THRESHOLD_DISTANCE           100
+#define DISTANT_OBSTACLE_THRESHOLD_DISTANCE   75
+#define NEAR_OBSTACLE_THRESHOLD_DISTANCE      50
+	
+#define WATER_LEVEL_THRESHOLD_A               50
+#define WATER_LEVEL_THRESHOLD_B               500
+
+uint8_t assessment_tick_counter;
+
+void assess_obstacle_situation()
+{
+top_sonar_data /= num_of_samples;
+bottom_sonar_data /= num_of_samples;
+water_level /= num_of_samples;
+
+DIAGNOSTICS( Serial.print("Mean top sensor data: "); )
+DIAGNOSTICS( Serial.print(top_sonar_data); )
+DIAGNOSTICS( Serial.println(" cm"); )
+
+DIAGNOSTICS( Serial.print("Mean bottom sensor data: "); )
+DIAGNOSTICS( Serial.print(bottom_sonar_data); )
+DIAGNOSTICS( Serial.println(" cm"); )
+
+DIAGNOSTICS( Serial.print("Water level reading: "); )
+DIAGNOSTICS( Serial.print(water_level); )
+
+if(top_sonar_data > OBSTACLE_THRESHOLD_DISTANCE &&
+bottom_sonar_data > OBSTACLE_THRESHOLD_DISTANCE &&
+water_level < WATER_LEVEL_THRESHOLD_A) {
+alert_on_period = 0;
+alert_flag = false;
+}
+else /*if(top_sonar_data > 0 || bottom_sonar_data > 0)*/ {
+alert_flag = true;
+if(top_sonar_data < NEAR_OBSTACLE_THRESHOLD_DISTANCE ||
+bottom_sonar_data < NEAR_OBSTACLE_THRESHOLD_DISTANCE ||
+water_level > WATER_LEVEL_THRESHOLD_B) {
+alert_on_period = 50;
+}
+else {
+alert_on_period = 10;
+}
+trg_install(TRG_SLOT_3, 0, alert, NULL);
+}
+
+num_of_samples = 0;
+top_sonar_data = 0;
+bottom_sonar_data = 0;
+water_level = 0;
+}
+
+void setup()
+{
+DIAGNOSTICS( Serial.begin(9600); )
+
+top_sonar_data = 0;
+bottom_sonar_data = 0;
+water_level = 0;
+alert_flag = 0;
+alert_on_period = 0;
+num_of_samples = 0;
+assessment_tick_counter = 0;
+get_data_tick_counter = 0;
+
+trg_init();
+//trg_install(TRG_SLOT_1, 10, get_obstacle_data, NULL);
+//trg_install(TRG_SLOT_2, 20, assess_obstacle_situation, NULL);
+
+pinMode(BUZZER, OUTPUT);
+pinMode(VIBRATOR, OUTPUT);
+TURN_OFF_BUZZER();
+TURN_OFF_VIBRATOR();
+
+delay(2000);
+
+TURN_ON_BUZZER();
+delay(100);
+TURN_OFF_BUZZER();
+TURN_ON_VIBRATOR();
+delay(100);
+TURN_OFF_VIBRATOR();
+
+Timer1.initialize(100000); // set a timer of length 100000 microseconds (or 0.1 sec, or 10Hz)
+Timer1.attachInterrupt( timer1_isr ); // attach the service routine here
+}
+
+void loop()
+{
+if(get_data_tick_counter >= 2) {
+get_obstacle_data();
+get_data_tick_counter = 0;
+}
+
+if(assessment_tick_counter >= 20) {
+assess_obstacle_situation();
+assessment_tick_counter = 0;
+}
+}
+
+/// --------------------------
+/// Custom ISR Timer Routine
+/// --------------------------
+void timer1_isr()
+{
+assessment_tick_counter++;
+get_data_tick_counter++;
+trg_inc_tmr();
+}
